@@ -42,120 +42,117 @@ pub fn parse_arguments() -> Args {
         .author("Felix Wilhelm <fwilhelm@google.com>")
         .about(help::ABOUT)
         .setting(clap::AppSettings::ArgRequiredElseHelp)
-        .setting(clap::AppSettings::UnifiedHelpMessage)
-        .template(help::TEMPLATE)
-        .help_message("Prints help information.")
-        .version_message("Prints version information.")
+        .help_template(help::TEMPLATE)
         .arg(
-            Arg::with_name("PATTERN")
+            Arg::new("PATTERN")
                 .help("Search pattern.")
                 .long_help(help::PATTERN)
                 .required(true)
                 .index(1),
         )
         .arg(
-            Arg::with_name("p")
+            Arg::new("p")
                 .long("pattern")
-                .short("p")
+                .short('p')
                 .help("Specify additional search patterns.")
                 .takes_value(true)
-                .multiple(true)
+                .multiple_values(true)
                 .number_of_values(1),
         )
         .arg(
-            Arg::with_name("PATH")
+            Arg::new("PATH")
                 .help("A file or directory to search.")
                 .long_help(help::PATH)
                 .required(true)
                 .index(2),
         )
         .arg(
-            Arg::with_name("v")
+            Arg::new("v")
                 .long("verbose")
-                .short("v")
-                .multiple(true)
+                .short('v')
+                .multiple_occurrences(true)
                 .help("Sets the level of verbosity."),
         )
         .arg(
-            Arg::with_name("extensions")
+            Arg::new("extensions")
                 .long("extensions")
-                .short("e")
+                .short('e')
                 .takes_value(true)
-                .multiple(true)
+                .multiple_values(true)
                 .help("File extensions to include in the search."),
         )
         .arg(
-            Arg::with_name("before")
+            Arg::new("before")
                 .long("before")
-                .short("B")
+                .short('B')
                 .takes_value(true)
                 .help("Lines to print before a match. Default = 5."),
         )
         .arg(
-            Arg::with_name("after")
+            Arg::new("after")
                 .long("after")
-                .short("A")
+                .short('A')
                 .takes_value(true)
                 .help("Lines to print after a match. Default = 5."),
         )
         .arg(
-            Arg::with_name("limit")
+            Arg::new("limit")
                 .long("limit")
-                .short("l")
+                .short('l')
                 .takes_value(false)
                 .help("Only show the first match in each function."),
         )
         .arg(
-            Arg::with_name("regex")
+            Arg::new("regex")
                 .long("regex")
-                .short("R")
+                .short('R')
                 .takes_value(true)
-                .multiple(true)
+                .multiple_occurrences(true)
                 .number_of_values(1)
                 .help("Enforce that a variable has to (not) match a regex.")
                 .long_help(help::REGEX),
         )
         .arg(
-            Arg::with_name("cpp")
-                .short("X")
+            Arg::new("cpp")
+                .short('X')
                 .long("cpp")
                 .takes_value(false)
                 .help("Enable C++ mode."),
         )
         .arg(
-            Arg::with_name("color")
-                .short("C)")
+            Arg::new("color")
+                .short('C')
                 .long("color")
                 .takes_value(false)
                 .help("Force enable color output."),
         )
         .arg(
-            Arg::with_name("force")
+            Arg::new("force")
                 .long("force")
-                .short("f")
+                .short('f')
                 .takes_value(false)
                 .help("Force a search even if the queries contains syntax errors."),
         )
         .arg(
-            Arg::with_name("unique")
+            Arg::new("unique")
                 .long("unique")
-                .short("u")
+                .short('u')
                 .takes_value(false)
                 .help("Enforce uniqueness of variable matches.")
                 .long_help(help::UNIQUE),
         )
         .arg(
-            Arg::with_name("exclude")
+            Arg::new("exclude")
                 .long("exclude")
                 .takes_value(true)
-                .multiple(true)
+                .multiple_values(true)
                 .help("Exclude files that match the given regex."),
         )
         .arg(
-            Arg::with_name("include")
+            Arg::new("include")
                 .long("include")
                 .takes_value(true)
-                .multiple(true)
+                .multiple_values(true)
                 .help("Only search files that match the given regex."),
         )
         .get_matches();
@@ -271,7 +268,7 @@ mod help {
  {positionals}
  
  OPTIONS:
- {unified}";
+ {options}";
  
  pub const PATTERN: &str = "\
  A weggli search pattern. weggli's query language closely resembles
