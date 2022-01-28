@@ -48,7 +48,7 @@ pub fn parse_arguments() -> Args {
                 .help("Search pattern.")
                 .long_help(help::PATTERN)
                 .required(true)
-                .index(1),
+                .index(2),
         )
         .arg(
             Arg::new("p")
@@ -64,7 +64,7 @@ pub fn parse_arguments() -> Args {
                 .help("A file or directory to search.")
                 .long_help(help::PATH)
                 .required(true)
-                .index(2),
+                .index(1),
         )
         .arg(
             Arg::new("v")
