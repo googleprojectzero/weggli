@@ -15,7 +15,7 @@
  */
 
 use std::{path::{Path, PathBuf}};
-use clap::{App, Arg};
+use clap::{App, Arg, ArgGroup};
 use simplelog::*;
 
 pub struct Args {
@@ -32,6 +32,7 @@ pub struct Args {
     pub force_query: bool,
     pub include: Vec<String>,
     pub exclude: Vec<String>,
+    pub repl: bool,
 }
 
 /// Parse command arguments and return them inside the Args structure.
@@ -47,7 +48,6 @@ pub fn parse_arguments() -> Args {
             Arg::new("PATTERN")
                 .help("Search pattern.")
                 .long_help(help::PATTERN)
-                .required(true)
                 .index(2),
         )
         .arg(
@@ -58,6 +58,19 @@ pub fn parse_arguments() -> Args {
                 .takes_value(true)
                 .multiple_values(true)
                 .number_of_values(1),
+        )
+        .arg(
+            Arg::new("repl")
+                .long("repl")
+                .short('r')
+                .conflicts_with("p")
+                .conflicts_with("PATTERN")
+                .help("Start a REPL prompt, parsing completely file completely initially")
+        )
+        .group(
+            ArgGroup::new("pattern or repl")
+                .required(true)
+                .args(&["repl", "PATTERN"]),
         )
         .arg(
             Arg::new("PATH")
@@ -175,7 +188,10 @@ pub fn parse_arguments() -> Args {
 
     let directory = Path::new(matches.value_of("PATH").unwrap_or("."));
 
-    let mut pattern = vec![matches.value_of("PATTERN").unwrap().to_string()];
+    let mut pattern: Vec<String> = Vec::with_capacity(1);
+    if let Some(p) = matches.value_of("PATTERN") {
+        pattern.push(p.to_string());
+    }
     if let Some(p) = matches.values_of("p") {
         pattern.extend(p.map(|v| v.to_string()))
     }
@@ -229,6 +245,8 @@ pub fn parse_arguments() -> Args {
 
     let force_query = matches.occurrences_of("force") > 0;
 
+    let repl = matches.occurrences_of("repl") > 0;
+
     Args {
         path,
         pattern,
@@ -243,6 +261,7 @@ pub fn parse_arguments() -> Args {
         force_query,
         include,
         exclude,
+        repl,
     }
 }
 
