@@ -32,12 +32,14 @@ pub struct Args {
     pub force_query: bool,
     pub include: Vec<String>,
     pub exclude: Vec<String>,
+    #[cfg(feature="binja")]
+    pub binja: bool,
 }
 
 /// Parse command arguments and return them inside the Args structure.
 /// The clap crate handles program exit and error messages for invalid arguments.
 pub fn parse_arguments() -> Args {
-    let matches = App::new("weggli")
+    let mut parser = App::new("weggli")
         .version("0.2.3")
         .author("Felix Wilhelm <fwilhelm@google.com>")
         .about(help::ABOUT)
@@ -154,8 +156,20 @@ pub fn parse_arguments() -> Args {
                 .takes_value(true)
                 .multiple_values(true)
                 .help("Only search files that match the given regex."),
-        )
-        .get_matches();
+        );
+
+    if cfg!(feature="binja") {
+        parser = parser.arg(
+            Arg::new("binja")
+                .long("binja")
+                .short('b')
+                .takes_value(false)
+                .conflicts_with("cpp")
+                .help("Use binaryninja to decompile a binary to query")
+        );
+    }
+
+    let matches = parser.get_matches();
 
     let helper = |option_name| -> Vec<String> {
         if let Some(v) = matches.values_of(option_name) {
@@ -205,10 +219,18 @@ pub fn parse_arguments() -> Args {
     let cpp = matches.occurrences_of("cpp") > 0;
     let force_color = matches.occurrences_of("color") > 0;
 
+    let binja = if cfg!(feature="binja") {
+        matches.occurrences_of("binja") > 0
+    } else {
+        false
+    };
+
     let extensions = {
         let e = helper("extensions");
-        if e.is_empty() {
-            if !cpp {
+        if e.is_empty() && matches.occurrences_of("extensions") > 0 {
+            if binja {
+                vec![]
+            } else if !cpp {
                 vec!["c".to_string(), "h".into()]
             } else {
                 vec![
@@ -243,6 +265,8 @@ pub fn parse_arguments() -> Args {
         force_query,
         include,
         exclude,
+        #[cfg(feature="binja")]
+        binja,
     }
 }
 

@@ -38,6 +38,9 @@ use weggli::builder::build_query_tree;
 use weggli::query::QueryTree;
 use weggli::result::QueryResult;
 
+#[cfg(feature="binja")]
+use weggli::binja;
+
 mod cli;
 
 fn main() {
@@ -142,6 +145,15 @@ fn main() {
         std::process::exit(1)
     }
 
+    #[cfg(feature="binja")]
+    let binja = args.binja;
+
+    #[cfg(feature="binja")]
+    if binja {
+        binaryninja::headless::init();
+    }
+
+
     // The main parallelized work pipeline
     rayon::scope(|s| {
         // spin up channels for worker communication
@@ -155,6 +167,15 @@ fn main() {
         let after = args.after;
 
         // Spawn worker to iterate through files, parse potential matches and forward ASTs
+        #[cfg(feature="binja")]
+        if args.binja {
+            s.spawn(move|_| parse_binja_binaries_worker(files, ast_tx, w));
+        } else {
+            s.spawn(move |_| parse_files_worker(files, ast_tx, w, cpp));
+        }
+
+        // Spawn worker to iterate through files, parse potential matches and forward ASTs
+        #[cfg(not(feature="binja"))]
         s.spawn(move |_| parse_files_worker(files, ast_tx, w, cpp));
 
         // Run search queries on ASTs and apply CLI constraints
@@ -167,6 +188,12 @@ fn main() {
             s.spawn(move |_| multi_query_worker(results_rx, w.len(), before, after));
         }
     });
+
+    #[cfg(feature="binja")]
+    if binja {
+        binaryninja::headless::shutdown();
+    }
+
 }
 
 /// Supported root node types.
@@ -370,6 +397,10 @@ fn iter_files(path: &Path, extensions: Vec<String>) -> impl Iterator<Item = walk
 
             let path = entry.path();
 
+            if extensions.is_empty() {
+                return true;
+            }
+
             match path.extension() {
                 None => return false,
                 Some(ext) => {
@@ -417,6 +448,30 @@ fn parse_files_worker(
                 }
             };
             if let Some((source_tree, source)) = maybe_parse(&path) {
+                sender
+                    .send((
+                        std::sync::Arc::new(source),
+                        source_tree,
+                        path.display().to_string(),
+                    ))
+                    .unwrap();
+            }
+        });
+}
+
+#[cfg(feature="binja")]
+fn parse_binja_binaries_worker(
+    files: Vec<PathBuf>,
+    sender: Sender<(Arc<String>, Tree, String)>,
+    _work: &[WorkItem]
+) {
+    files
+        .into_par_iter()
+        .for_each_with(sender, move |sender, path| {
+            let decomp = binja::Decompiler::from_file(&path);
+            for function in &decomp.functions() {
+                let source = decomp.decompile_function(&function);
+                let source_tree = weggli::parse(&source, false);
                 sender
                     .send((
                         std::sync::Arc::new(source),
