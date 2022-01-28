@@ -44,6 +44,9 @@ use weggli::builder::build_query_tree;
 use weggli::query::QueryTree;
 use weggli::result::QueryResult;
 
+#[cfg(feature="binja")]
+use weggli::binja;
+
 mod cli;
 mod repl;
 
@@ -183,6 +186,15 @@ fn normal_mode(args: cli::Args, regex_constraints: RegexMap) -> Result<(), Strin
         std::process::exit(1)
     }
 
+    #[cfg(feature="binja")]
+    let binja = args.binja;
+
+    #[cfg(feature="binja")]
+    if binja {
+        binaryninja::headless::init();
+    }
+
+
     // The main parallelized work pipeline
     rayon::scope(|s| {
         // spin up channels for worker communication
@@ -196,6 +208,15 @@ fn normal_mode(args: cli::Args, regex_constraints: RegexMap) -> Result<(), Strin
         let after = args.after;
 
         // Spawn worker to iterate through files, parse potential matches and forward ASTs
+        #[cfg(feature="binja")]
+        if args.binja {
+            s.spawn(move|_| parse_binja_binaries_worker(files, ast_tx, Some(w), None));
+        } else {
+            s.spawn(move |_| parse_files_worker(files, ast_tx, Some(w), None, cpp));
+        }
+
+        // Spawn worker to iterate through files, parse potential matches and forward ASTs
+        #[cfg(not(feature="binja"))]
         s.spawn(move |_| parse_files_worker(files, ast_tx, Some(w), None, cpp));
 
         // Run search queries on ASTs and apply CLI constraints
@@ -208,6 +229,11 @@ fn normal_mode(args: cli::Args, regex_constraints: RegexMap) -> Result<(), Strin
             s.spawn(move |_| multi_query_worker(results_rx, w.len(), before, after));
         }
     });
+
+    #[cfg(feature="binja")]
+    if binja {
+        binaryninja::headless::shutdown();
+    }
 
     Ok(())
 }
@@ -226,6 +252,14 @@ fn start_repl(args: cli::Args, regex_constraints: RegexMap) {
     let  (files, total_size) = collect_files(&args);
 
     let mut parsed = HashMap::new();
+
+    #[cfg(feature="binja")]
+    let binja = args.binja;
+
+    #[cfg(feature="binja")]
+    if binja {
+        binaryninja::headless::init();
+    }
 
     info!("parsing {} files", files.len());
     if files.is_empty() {
@@ -246,6 +280,15 @@ fn start_repl(args: cli::Args, regex_constraints: RegexMap) {
 
         // Spawn worker to iterate through files, parse potential matches and forward ASTs
         // We send a None WorkItem, as this is constant startup parsing overhead.
+        #[cfg(feature="binja")]
+        if args.binja {
+            s.spawn(|_| parse_binja_binaries_worker(files, ast_tx, None, Some(&progress_bar)));
+        } else {
+            s.spawn(|_| parse_files_worker(files, ast_tx, None, Some(&progress_bar), cpp));
+        }
+
+        // Spawn worker to iterate through files, parse potential matches and forward ASTs
+        #[cfg(not(feature="binja"))]
         s.spawn(|_| parse_files_worker(files, ast_tx, None, Some(&progress_bar), cpp));
 
         // Spawn another worker to gather the files into the hashmap
@@ -266,13 +309,18 @@ fn start_repl(args: cli::Args, regex_constraints: RegexMap) {
             Err(_) => println!("{}", "No input".red()),
         };
     }
+
+    #[cfg(feature="binja")]
+    if binja {
+        binaryninja::headless::shutdown();
+    }
 }
 
 fn do_repl_single_query(
     pattern: String,
     args: &cli::Args,
     regex_constraints: &RegexMap,
-    parsed: &HashMap<String,(Tree, Arc<String>)>
+    parsed: &HashMap<Location, (Tree, Arc<String>)>
 ) -> Result<(), String> {
     let mut variables = HashSet::new();
 
@@ -515,6 +563,10 @@ fn iter_files(path: &Path, extensions: Vec<String>) -> impl Iterator<Item = walk
 
             let path = entry.path();
 
+            if extensions.is_empty() {
+                return true;
+            }
+
             match path.extension() {
                 None => return false,
                 Some(ext) => {
@@ -532,11 +584,31 @@ struct WorkItem {
     identifiers: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Location {
+    SourceFile{ path: String },
+    BinaryFunction{ path: String, address: u64 },
+}
+
+impl Location {
+    pub  fn format_with_line(&self, line: usize) -> String {
+        match self {
+            Location::SourceFile { path: p } => {
+                format!("{}:{}", p.green().bold(), line )
+            },
+            Location::BinaryFunction { path: p, address } => {
+                let address = format!("0x{:x}", address);
+                format!("{}: {}", p.green().bold(), address.yellow())
+            },
+        }
+    }
+}
+
 /// Iterate over all paths in `files`, parse files that might contain a match for any of the queries
 /// in `work` and send them to the next worker using `sender`.
 fn parse_files_worker(
     files: Vec<(PathBuf, u64)>,
-    sender: Sender<(Arc<String>, Tree, String)>,
+    sender: Sender<(Arc<String>, Tree, Location)>,
     work: Option<&[WorkItem]>,
     progress_bar: Option<&indicatif::ProgressBar>,
     is_cpp: bool,
@@ -576,7 +648,7 @@ fn parse_files_worker(
                     .send((
                         std::sync::Arc::new(source),
                         source_tree,
-                        path.display().to_string(),
+                        Location::SourceFile{ path: path.display().to_string() },
                     ))
                     .unwrap();
                 if let Some(progress) = progress_bar {
@@ -586,26 +658,60 @@ fn parse_files_worker(
         });
 }
 
+#[cfg(feature="binja")]
+fn parse_binja_binaries_worker(
+    files: Vec<(PathBuf, u64)>,
+    sender: Sender<(Arc<String>, Tree, Location)>,
+    _work: Option<&[WorkItem]>,
+    progress_bar: Option<&indicatif::ProgressBar>,
+) {
+    files
+        .into_par_iter()
+        .for_each_with(sender, move |sender, (path, sz)| {
+            let decomp = binja::Decompiler::from_file(&path);
+
+            let n_functions = decomp.functions().len();
+            let chunk_size: f64 = sz as f64 / n_functions as f64;
+
+            for (i, function) in decomp.functions().iter().enumerate() {
+                let source = decomp.decompile_function(&function);
+                let source_tree = weggli::parse(&source, false);
+                sender
+                    .send((
+                        std::sync::Arc::new(source),
+                        source_tree,
+                        Location::BinaryFunction{ path: path.display().to_string(), address: function.start() },
+                    ))
+                    .unwrap();
+                if let Some(progress) = progress_bar {
+                    let inc = ((i+1) as f64 * chunk_size) as u64 - (i as f64 * chunk_size) as u64;
+                    progress.inc(inc as u64);
+                }
+            }
+        });
+}
+
 struct ResultsCtx {
     query_index: usize,
-    path: String,
+    location: Location,
     source: std::sync::Arc<String>,
     result: weggli::result::QueryResult,
 }
+
 
 /// Fetches parsed ASTs from `receiver`, runs all queries in `work` on them and
 /// filters the results based on the provided regex `constraints` and --unique --limit switches.
 /// For single query runs, the remaining results are directly printed. Otherwise they get forwarded
 /// to `multi_query_worker` through the `results_tx` channel.
 fn execute_queries_worker(
-    receiver: Receiver<(Arc<String>, Tree, String)>,
+    receiver: Receiver<(Arc<String>, Tree, Location)>,
     results_tx: Sender<ResultsCtx>,
     work: &[WorkItem],
     args: &cli::Args,
 ) {
     receiver.into_iter().par_bridge().for_each_with(
         results_tx,
-        |results_tx, (source, tree, path)| {
+        |results_tx, (source, tree, location)| {
             // For each query
             work.iter()
                 .enumerate()
@@ -647,9 +753,8 @@ fn execute_queries_worker(
                         if work.len() == 1 {
                             let line = source[..m.start_offset()].matches('\n').count() + 1;
                             println!(
-                                "{}:{}\n{}",
-                                path.clone().bold(),
-                                line,
+                                "{}\n{}",
+                                location.format_with_line(line),
                                 m.display(&source, args.before, args.after)
                             );
                         } else {
@@ -657,7 +762,7 @@ fn execute_queries_worker(
                                 .send(ResultsCtx {
                                     query_index: i,
                                     result: m,
-                                    path: path.clone(),
+                                    location: location.clone(),
                                     source: source.clone(),
                                 })
                                 .unwrap();
@@ -718,9 +823,8 @@ fn multi_query_worker(
         rv.into_iter().for_each(|r| {
             let line = r.source[..r.result.start_offset()].matches('\n').count() + 1;
             println!(
-                "{}:{}\n{}",
-                r.path.bold(),
-                line,
+                "{}\n{}",
+                r.location.format_with_line(line),
                 r.result.display(&r.source, before, after)
             );
         })
@@ -728,20 +832,20 @@ fn multi_query_worker(
 }
 
 fn gather_parsed_worker(
-    receiver: Receiver<(Arc<String>, Tree, String)>,
-    hashmap: &mut HashMap<String, (Tree, Arc<String>)>,
+    receiver: Receiver<(Arc<String>, Tree, Location)>,
+    hashmap: &mut HashMap<Location, (Tree, Arc<String>)>,
 ) {
-    for (source, tree, path) in receiver.into_iter() {
-        hashmap.insert(path, (tree, source));
+    for (source, tree, location) in receiver.into_iter() {
+        hashmap.insert(location, (tree, source));
     }
 }
 
 fn retrieve_asts(
-    sender: Sender<(Arc<String>, Tree, String)>,
-    hashmap: &HashMap<String, (Tree, Arc<String>)>
+    sender: Sender<(Arc<String>, Tree, Location)>,
+    hashmap: &HashMap<Location, (Tree, Arc<String>)>
 ) {
-    for (path, (tree, source)) in hashmap {
-        sender.send((source.clone(), tree.clone(), path.clone())).unwrap();
+    for (location, (tree, source)) in hashmap {
+        sender.send((source.clone(), tree.clone(), location.clone())).unwrap();
     }
 }
 

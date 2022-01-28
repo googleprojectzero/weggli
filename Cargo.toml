@@ -9,6 +9,7 @@ description = "weggli is a fast and robust semantic search tool for C and C++ co
 
 [features]
 python = ["pyo3"]
+binja = ["binaryninja"]
 
 [lib]
 crate-type = ["rlib", "dylib"]
@@ -33,6 +34,10 @@ indicatif = "0.16.2"
 [dependencies.pyo3]
 version = "0.13.0"
 features = ["extension-module"]
+optional = true
+
+[dependencies.binaryninja]
+path = "../binaryninja-api/rust/"
 optional = true
 
 [target.'cfg(target_family = "unix")'.dependencies]
