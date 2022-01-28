@@ -418,11 +418,35 @@ struct WorkItem {
     identifiers: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Location {
+    SourceFile{ path: String },
+
+    #[cfg(feature="binja")]
+    BinaryFunction{ path: String, address: u64 },
+}
+
+impl Location {
+    pub  fn format_with_line(&self, line: usize) -> String {
+        match self {
+            Location::SourceFile { path: p } => {
+                format!("{}:{}", p.green().bold(), line )
+            },
+
+            #[cfg(feature="binja")]
+            Location::BinaryFunction { path: p, address } => {
+                let address = format!("0x{:x}", address);
+                format!("{}: {}", p.green().bold(), address.yellow())
+            },
+        }
+    }
+}
+
 /// Iterate over all paths in `files`, parse files that might contain a match for any of the queries
 /// in `work` and send them to the next worker using `sender`.
 fn parse_files_worker(
     files: Vec<PathBuf>,
-    sender: Sender<(Arc<String>, Tree, String)>,
+    sender: Sender<(Arc<String>, Tree, Location)>,
     work: &[WorkItem],
     is_cpp: bool,
 ) {
@@ -452,7 +476,7 @@ fn parse_files_worker(
                     .send((
                         std::sync::Arc::new(source),
                         source_tree,
-                        path.display().to_string(),
+                        Location::SourceFile{ path: path.display().to_string() },
                     ))
                     .unwrap();
             }
@@ -462,7 +486,7 @@ fn parse_files_worker(
 #[cfg(feature="binja")]
 fn parse_binja_binaries_worker(
     files: Vec<PathBuf>,
-    sender: Sender<(Arc<String>, Tree, String)>,
+    sender: Sender<(Arc<String>, Tree, Location)>,
     _work: &[WorkItem]
 ) {
     files
@@ -476,7 +500,7 @@ fn parse_binja_binaries_worker(
                     .send((
                         std::sync::Arc::new(source),
                         source_tree,
-                        path.display().to_string(),
+                        Location::BinaryFunction{ path: path.display().to_string(), address: function.start() },
                     ))
                     .unwrap();
             }
@@ -485,24 +509,25 @@ fn parse_binja_binaries_worker(
 
 struct ResultsCtx {
     query_index: usize,
-    path: String,
+    location: Location,
     source: std::sync::Arc<String>,
     result: weggli::result::QueryResult,
 }
+
 
 /// Fetches parsed ASTs from `receiver`, runs all queries in `work` on them and
 /// filters the results based on the provided regex `constraints` and --unique --limit switches.
 /// For single query runs, the remaining results are directly printed. Otherwise they get forwarded
 /// to `multi_query_worker` through the `results_tx` channel.
 fn execute_queries_worker(
-    receiver: Receiver<(Arc<String>, Tree, String)>,
+    receiver: Receiver<(Arc<String>, Tree, Location)>,
     results_tx: Sender<ResultsCtx>,
     work: &[WorkItem],
     args: &cli::Args,
 ) {
     receiver.into_iter().par_bridge().for_each_with(
         results_tx,
-        |results_tx, (source, tree, path)| {
+        |results_tx, (source, tree, location)| {
             // For each query
             work.iter()
                 .enumerate()
@@ -544,9 +569,8 @@ fn execute_queries_worker(
                         if work.len() == 1 {
                             let line = source[..m.start_offset()].matches('\n').count() + 1;
                             println!(
-                                "{}:{}\n{}",
-                                path.clone().bold(),
-                                line,
+                                "{}\n{}",
+                                location.format_with_line(line),
                                 m.display(&source, args.before, args.after)
                             );
                         } else {
@@ -554,7 +578,7 @@ fn execute_queries_worker(
                                 .send(ResultsCtx {
                                     query_index: i,
                                     result: m,
-                                    path: path.clone(),
+                                    location: location.clone(),
                                     source: source.clone(),
                                 })
                                 .unwrap();
@@ -615,9 +639,8 @@ fn multi_query_worker(
         rv.into_iter().for_each(|r| {
             let line = r.source[..r.result.start_offset()].matches('\n').count() + 1;
             println!(
-                "{}:{}\n{}",
-                r.path.bold(),
-                line,
+                "{}\n{}",
+                r.location.format_with_line(line),
                 r.result.display(&r.source, before, after)
             );
         })
