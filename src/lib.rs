@@ -26,6 +26,9 @@ pub mod builder;
 mod capture;
 mod util;
 
+#[cfg(feature = "binja")]
+pub mod binja;
+
 #[cfg(feature = "python")]
 pub mod python;
 pub mod query;
