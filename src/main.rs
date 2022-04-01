@@ -25,10 +25,16 @@ use colored::Colorize;
 use rayon::iter::ParallelBridge;
 use rayon::prelude::*;
 use regex::Regex;
+use rustyline::error::ReadlineError;
+use rustyline::{CompletionType, Config, EditMode};
+use rustyline::config::OutputStreamType;
+
+use std::fmt::Write;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{mpsc, Arc};
 use std::{collections::HashMap, path::Path};
 use std::{collections::HashSet, fs};
+use std::convert::TryInto;
 use std::{io::prelude::*, path::PathBuf};
 use tree_sitter::Tree;
 use walkdir::WalkDir;
@@ -39,6 +45,7 @@ use weggli::query::QueryTree;
 use weggli::result::QueryResult;
 
 mod cli;
+mod repl;
 
 fn main() {
     reset_signal_pipe_handler();
@@ -48,9 +55,6 @@ fn main() {
     if args.force_color {
         colored::control::set_override(true)
     }
-
-    // Keep track of all variables used in the input pattern(s)
-    let mut variables = HashSet::new();
 
     // Validate all regular expressions
     let regex_constraints = process_regexes(&args.regexes).unwrap_or_else(|e| {
@@ -65,31 +69,17 @@ fn main() {
         std::process::exit(1)
     });
 
-    // Normalize all patterns and translate them into QueryTrees
-    // We also extract the identifiers at this point
-    // to use them for file filtering later on.
-    // Invalid patterns trigger a process exit in validate_query so
-    // after this point we now that all patterns are valid.
-    // The loop also fills the `variables` set with used variable names.
-    let work: Vec<WorkItem> = args
-        .pattern
-        .iter()
-        .map(|pattern| {
-            let qt = parse_search_pattern(pattern, args.cpp, args.force_query, &regex_constraints);
-
-            let identifiers = qt.identifiers();
-            variables.extend(qt.variables());
-            WorkItem { qt, identifiers }
-        })
-        .collect();
-
-    for v in regex_constraints.variables() {
-        if !variables.contains(v) {
-            eprintln!("'{}' is not a valid query variable", v.red());
-            std::process::exit(1)
+    if args.repl {
+        start_repl(args, regex_constraints);
+    } else {
+        if let Err(msg) = normal_mode(args, regex_constraints) {
+            eprintln!("{}", msg);
+            std::process::exit(1);
         }
     }
+}
 
+fn collect_files(args: &cli::Args) -> (Vec<(PathBuf, u64)>, u64) {
     // Verify that the --include and --exclude regexes are valid.
     let helper_regex = |v: &[String]| -> Vec<Regex> {
         v.iter()
@@ -110,31 +100,82 @@ fn main() {
     let include_re = helper_regex(&args.include);
 
     // Collect and filter our input file set.
-    let mut files: Vec<PathBuf> = if args.path.to_string_lossy() == "-" {
+    let mut files: Vec<(PathBuf, u64)> = if args.path.to_string_lossy() == "-" {
         std::io::stdin()
             .lock()
             .lines()
             .filter_map(|l| l.ok())
-            .map(|s| Path::new(&s).to_path_buf())
+            .map(|s| {
+                let path = Path::new(&s).to_path_buf();
+                let sz = fs::metadata(&path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0);
+                (path, sz)
+            })
             .collect()
     } else {
         iter_files(&args.path, args.extensions.clone())
-            .map(|d| d.into_path())
+            .map(|d| {
+                let path = d.into_path();
+                let sz = fs::metadata(&path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0);
+                (path, sz)
+            })
             .collect()
     };
+
+    let total_size = files.iter().map(|it| it.1).sum();
 
     if !exclude_re.is_empty() || !include_re.is_empty() {
         // Filter files based on include and exclude regexes
         files.retain(|f| {
-            if exclude_re.iter().any(|r| r.is_match(&f.to_string_lossy())) {
+            if exclude_re.iter().any(|r| r.is_match(&f.0.to_string_lossy())) {
                 return false;
             }
             if include_re.is_empty() {
                 return true;
             }
-            include_re.iter().any(|r| r.is_match(&f.to_string_lossy()))
+            include_re.iter().any(|r| r.is_match(&f.0.to_string_lossy()))
         });
     }
+
+    (files, total_size)
+}
+
+fn normal_mode(args: cli::Args, regex_constraints: RegexMap) -> Result<(), String> {
+    // Keep track of all variables used in the input pattern(s)
+    let mut variables = HashSet::new();
+
+    // Normalize all patterns and translate them into QueryTrees
+    // We also extract the identifiers at this point
+    // to use them for file filtering later on.
+    // Invalid patterns trigger a process exit in validate_query so
+    // after this point we now that all patterns are valid.
+    // The loop also fills the `variables` set with used variable names.
+    let work: Vec<WorkItem> = args
+        .pattern
+        .iter()
+        .map(|pattern| {
+            parse_search_pattern(pattern, args.cpp, args.force_query, &regex_constraints)
+        })
+        .collect::<Result<Vec<QueryTree>, String>>()?
+        .into_iter()
+        .map(|qt| {
+            let identifiers = qt.identifiers();
+            variables.extend(qt.variables());
+            WorkItem { qt, identifiers }
+        })
+        .collect();
+
+    for v in regex_constraints.variables() {
+        if !variables.contains(v) {
+            eprintln!("'{}' is not a valid query variable", v.red());
+            std::process::exit(1)
+        }
+    }
+
+    let  (files, _) = collect_files(&args);
 
     info!("parsing {} files", files.len());
     if files.is_empty() {
@@ -155,7 +196,7 @@ fn main() {
         let after = args.after;
 
         // Spawn worker to iterate through files, parse potential matches and forward ASTs
-        s.spawn(move |_| parse_files_worker(files, ast_tx, w, cpp));
+        s.spawn(move |_| parse_files_worker(files, ast_tx, Some(w), None, cpp));
 
         // Run search queries on ASTs and apply CLI constraints
         // on the results. For single query executions, we can
@@ -167,6 +208,104 @@ fn main() {
             s.spawn(move |_| multi_query_worker(results_rx, w.len(), before, after));
         }
     });
+
+    Ok(())
+}
+
+fn start_repl(args: cli::Args, regex_constraints: RegexMap) {
+    let config = Config::builder()
+        .history_ignore_space(true)
+        .completion_type(CompletionType::List)
+        .edit_mode(EditMode::Emacs)
+        .output_stream(OutputStreamType::Stdout)
+        .build();
+
+    let mut rl = rustyline::Editor::with_config(config);
+    rl.set_helper(Some(repl::ReplHelper::new()));
+
+    let  (files, total_size) = collect_files(&args);
+
+    let mut parsed = HashMap::new();
+
+    info!("parsing {} files", files.len());
+    if files.is_empty() {
+        eprintln!("{}", String::from("No files to parse. Exiting...").red());
+        std::process::exit(1)
+    }
+
+    let progress_bar = indicatif::ProgressBar::new(total_size.try_into().unwrap());
+    let style = indicatif::ProgressStyle::default_bar()
+        .template("{prefix:.bold.dim} {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})");
+    progress_bar.set_style(style);
+    progress_bar.set_prefix("Loading");
+
+    let cpp = args.cpp;
+    // Parallelized parsing pipeline
+    rayon::scope(|s| {
+        let (ast_tx, ast_rx) = mpsc::channel();
+
+        // Spawn worker to iterate through files, parse potential matches and forward ASTs
+        // We send a None WorkItem, as this is constant startup parsing overhead.
+        s.spawn(|_| parse_files_worker(files, ast_tx, None, Some(&progress_bar), cpp));
+
+        // Spawn another worker to gather the files into the hashmap
+        s.spawn(|_| gather_parsed_worker(ast_rx, &mut parsed));
+    });
+
+    progress_bar.finish_and_clear();
+
+    loop {
+        let readline = rl.readline(&(">> ".red()));
+        match readline {
+            Ok(pattern) => {
+                if let Err(msg) = do_repl_single_query(pattern, &args, &regex_constraints, &parsed) {
+                    eprintln!("{}", msg.red().bold());
+                }
+            },
+            Err(ReadlineError::Eof) => break,
+            Err(_) => println!("{}", "No input".red()),
+        };
+    }
+}
+
+fn do_repl_single_query(
+    pattern: String,
+    args: &cli::Args,
+    regex_constraints: &RegexMap,
+    parsed: &HashMap<String,(Tree, Arc<String>)>
+) -> Result<(), String> {
+    let mut variables = HashSet::new();
+
+    let qt = parse_search_pattern(&pattern, args.cpp, args.force_query, regex_constraints)?;
+
+    let identifiers = qt.identifiers();
+    variables.extend(qt.variables());
+
+    let work = WorkItem { qt, identifiers };
+
+    for v in regex_constraints.variables() {
+        if !variables.contains(v) {
+            return Err(format!("'{}' is not a valid query variable", v.red()));
+        }
+    }
+
+    rayon::scope(|s| {
+        let (ast_tx, ast_rx) = mpsc::channel();
+        let (results_tx, _results_rx) = mpsc::channel();
+
+        s.spawn(move |_| retrieve_asts(ast_tx, parsed));
+
+        let w = [work];
+        // Run search queries on ASTs and apply CLI constraints
+        // on the results. For single query executions, we can
+        // directly print any remaining matches. For multi
+        // query runs we forward them to our next worker function
+        s.spawn(move |_| execute_queries_worker(ast_rx, results_tx, &w, args));
+
+        // No need to spawn a multi_query_worker, as w.len() is always 1.
+    });
+
+    Ok(())
 }
 
 /// Supported root node types.
@@ -189,7 +328,7 @@ fn parse_search_pattern(
     is_cpp: bool,
     force_query: bool,
     regex_constraints: &RegexMap,
-) -> QueryTree {
+) -> Result<QueryTree, String> {
     let mut tree = weggli::parse(pattern, is_cpp);
     let mut p = pattern;
 
@@ -228,9 +367,9 @@ fn parse_search_pattern(
         }
     }
 
-    let mut c = validate_query(&tree, p, force_query);
+    let mut c = validate_query(&tree, p, force_query)?;
 
-    build_query_tree(p, &mut c, is_cpp, Some(regex_constraints.clone()))
+    Ok(build_query_tree(p, &mut c, is_cpp, Some(regex_constraints.clone())))
 }
 
 /// Validates the user supplied search query and quits with an error message in case
@@ -241,9 +380,11 @@ fn validate_query<'a>(
     tree: &'a tree_sitter::Tree,
     query: &str,
     force: bool,
-) -> tree_sitter::TreeCursor<'a> {
+) -> Result<tree_sitter::TreeCursor<'a>, String> { 
+    let mut errmsg = String::new();
+
     if tree.root_node().has_error() && !force {
-        eprint!("{}", "Error! Query parsing failed:".red().bold());
+        write!(errmsg, "{}", "Error! Query parsing failed:".red().bold()).unwrap();
         let mut cursor = tree.root_node().walk();
 
         let mut first_error = None;
@@ -262,26 +403,28 @@ fn validate_query<'a>(
         }
 
         if let Some(node) = first_error {
-            eprint!(" {}", &query[0..node.start_byte()].italic());
+            write!(errmsg, " {}", &query[0..node.start_byte()].italic()).unwrap();
             if node.is_missing() {
-                eprint!(
+                write!(
+                    errmsg,
                     "{}{}{}",
                     " [MISSING ".red(),
                     node.kind().red().bold(),
                     " ] ".red()
-                );
+                ).unwrap();
             }
-            eprint!(
+            write!(
+                errmsg,
                 "{}",
                 &query[node.start_byte()..node.end_byte()]
                     .red()
                     .italic()
                     .bold()
-            );
-            eprintln!("{}", &query[node.end_byte()..].italic());
+            ).unwrap();
+            write!(errmsg, "{}", &query[node.end_byte()..].italic()).unwrap();
         }
 
-        std::process::exit(1);
+        return Err(errmsg);
     }
 
     info!("query sexp: {}", tree.root_node().to_sexp());
@@ -289,26 +432,28 @@ fn validate_query<'a>(
     let mut c = tree.walk();
 
     if c.node().named_child_count() > 1 {
-        eprintln!(
+        write!(
+            errmsg,
             "{}'{}' query contains multiple root nodes",
             "Error: ".red(),
             query
-        );
-        std::process::exit(1);
+        ).unwrap();
+        return Err(errmsg);
     }
 
     c.goto_first_child();
 
     if !VALID_NODE_KINDS.contains(&c.node().kind()) {
-        eprintln!(
+        write!(
+            errmsg,
             "{}'{}' is not a supported query root node.",
             "Error: ".red(),
             query
-        );
-        std::process::exit(1);
+        ).unwrap();
+        return Err(errmsg);
     }
 
-    c
+    Ok(c)
 }
 
 enum RegexError {
@@ -390,14 +535,15 @@ struct WorkItem {
 /// Iterate over all paths in `files`, parse files that might contain a match for any of the queries
 /// in `work` and send them to the next worker using `sender`.
 fn parse_files_worker(
-    files: Vec<PathBuf>,
+    files: Vec<(PathBuf, u64)>,
     sender: Sender<(Arc<String>, Tree, String)>,
-    work: &[WorkItem],
+    work: Option<&[WorkItem]>,
+    progress_bar: Option<&indicatif::ProgressBar>,
     is_cpp: bool,
 ) {
     files
         .into_par_iter()
-        .for_each_with(sender, move |sender, path| {
+        .for_each_with(sender, move |sender, (path, sz)| {
             let maybe_parse = |path| {
                 let c = match fs::read(path) {
                     Ok(content) => content,
@@ -406,13 +552,22 @@ fn parse_files_worker(
 
                 let source = String::from_utf8_lossy(&c);
 
-                let potential_match = work.iter().any(|WorkItem { qt: _, identifiers }| {
-                    identifiers.iter().all(|i| source.find(i).is_some())
-                });
+                // If we know what we're looking for, pre-filter during the parsing stage.
+                if let Some(work) = work {
+                    let potential_match = work.iter().any(|WorkItem { qt: _, identifiers }| {
+                        identifiers.iter().all(|i| source.find(i).is_some())
+                    });
 
-                if !potential_match {
-                    None
-                } else {
+                    if !potential_match {
+                        None
+                    } else {
+                        Some((weggli::parse(&source, is_cpp), source.to_string()))
+                    }
+                }
+                // We don't have a workitem, so we will parse the complete file. This is okay,
+                // as we're probably in a situation where there is a one-time parsing
+                // overhead in the repl.
+                else {
                     Some((weggli::parse(&source, is_cpp), source.to_string()))
                 }
             };
@@ -424,6 +579,9 @@ fn parse_files_worker(
                         path.display().to_string(),
                     ))
                     .unwrap();
+                if let Some(progress) = progress_bar {
+                    progress.inc(sz);
+                }
             }
         });
 }
@@ -567,6 +725,24 @@ fn multi_query_worker(
             );
         })
     });
+}
+
+fn gather_parsed_worker(
+    receiver: Receiver<(Arc<String>, Tree, String)>,
+    hashmap: &mut HashMap<String, (Tree, Arc<String>)>,
+) {
+    for (source, tree, path) in receiver.into_iter() {
+        hashmap.insert(path, (tree, source));
+    }
+}
+
+fn retrieve_asts(
+    sender: Sender<(Arc<String>, Tree, String)>,
+    hashmap: &HashMap<String, (Tree, Arc<String>)>
+) {
+    for (path, (tree, source)) in hashmap {
+        sender.send((source.clone(), tree.clone(), path.clone())).unwrap();
+    }
 }
 
 // Exit on SIGPIPE
